@@ -34,7 +34,7 @@ def wind_gusts(t):
 def rhs(t, x):
     pos, vel, th, om = x[0:3], x[3:6], x[6:9], x[9:12]
     s = x[12:_N_STATE]
-    V, ds = CTRL.command(z=pos[2], omega=om, s=s, theta=th, pos_xy=pos[0:2])
+    V, ds = CTRL.command(z=pos[2], omega=om, s=s, theta=th, pos_xy=pos[0:2], vel_xy=vel[0:2])
     torque, F, _ = motor_model(V, P)
     ang_acc = rotational_accel(torque, F, P)
     lin_acc = linear_accel(F, gust_force(wind_gusts(t), P), th, vel, P)
@@ -75,7 +75,7 @@ if __name__ == "__main__":
     pos, th = x[:, 0:3], np.degrees(x[:, 6:9])
 
     # recompute voltages for plotting
-    volt = np.array([CTRL.command(xi[2], xi[9:12], xi[12:_N_STATE], xi[6:9], xi[0:2])[0]
+    volt = np.array([CTRL.command(xi[2], xi[9:12], xi[12:_N_STATE], xi[6:9], xi[0:2], xi[3:5])[0]
                      for xi in x])
 
     np.savetxt("position_vector.csv", np.column_stack([t, pos]),

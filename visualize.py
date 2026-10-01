@@ -38,14 +38,14 @@ def rot(theta):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--zref",  type=float, default=10.0, help="altitude setpoint [m]")
-    ap.add_argument("--xy",    type=float, nargs=2,      default=(10, 10),
+    ap.add_argument("--xy",    type=float, nargs=2,      default=(0, 0),
                     metavar=("X", "Y"),
                     help="XY position setpoint [m], e.g. --xy 5 3.  "
                          "Enables the position controller.  Default: hover at (0,0).")
     ap.add_argument("--tend",  type=float, default=30.0, help="simulation length [s]")
     ap.add_argument("--speed", type=float, default=1.0,  help="playback speed (1 = real time)")
     ap.add_argument("--fps",   type=int,   default=30)
-    ap.add_argument("--att",   type=float, nargs=3, default=(0, 0, 10),
+    ap.add_argument("--att",   type=float, nargs=3, default=(0, 0, 360),
                     metavar=("PITCH", "ROLL", "YAW"),
                     help="static attitude target in degrees (ignored when --xy is given)")
     ap.add_argument("--legacy", action="store_true", help="original (unstable) Simulink gains/limits")

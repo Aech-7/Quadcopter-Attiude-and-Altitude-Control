@@ -108,7 +108,7 @@ class QuadController:
 
     def __init__(self, z_ref=20.0, rate_ref=(0.0, 0.0, 0.0), tuned=True,
                  att_ref_deg=None, kp_att=(4.0, 4.0, 0.7), max_rate=3.0,
-                 xy_ref=None, max_tilt_deg=20.0, kv_xy=0.4):
+                 xy_ref=None, max_tilt_deg=20.0, kv_xy=0.2):
         """
         Parameters
         ----------
@@ -125,6 +125,10 @@ class QuadController:
                        When set, the XY PIDs compute desired roll/pitch angles
                        to drive the quad to that horizontal position.
         max_tilt_deg : float   Hard limit on roll/pitch angle demanded by the XY loop [deg].
+        kv_xy        : float   Velocity damping gain [rad/(m/s)]. The current horizontal
+                       velocity is subtracted from the tilt command directly, acting as a
+                       true derivative brake on the state (not a filtered error signal).
+                       Increase to reduce overshoot; decrease if response feels sluggish.
         """
         self.z_ref = z_ref
         self.rate_ref = np.asarray(rate_ref, dtype=float)
@@ -139,6 +143,8 @@ class QuadController:
         # XY position setpoint
         self.xy_ref = None if xy_ref is None else np.asarray(xy_ref, dtype=float)
         self.max_tilt = np.radians(max_tilt_deg)         # max tilt from XY loop [rad]
+        self.kv_xy = float(kv_xy)                        # velocity damping [rad/(m/s)]
+
 
         # ---- Inner rate / altitude PIDs (unchanged from original) ----
         if tuned:
@@ -153,43 +159,52 @@ class QuadController:
             self.yaw   = PID(PIDGains(P=5.0,  I=0.5, D=0.0,  N=100.0, lower=0.0, upper=100.0))
         self._inner_pids = (self.alt, self.pitch, self.roll, self.yaw)
 
-        # ---- Outer XY position PIDs ----
-        # Output = desired tilt angle [rad], clipped to ±max_tilt.
-        # Gains tuned for the plant (m=0.743 kg, drag area ~0.02 m²):
-        #   Bandwidth ~0.3 rad/s, well below the attitude loop (~5 rad/s).
-        #   D-term with moderate filter (N=10) to damp velocity without noise amplification.
+        # ---- Outer XY position PIDs (pure PI — no D term) ----
+        # Velocity damping is handled explicitly via kv_xy * velocity, not via D-on-error.
+        # D-on-error is counter-productive: during the approach the error is large and
+        # positive, so D *adds* to the tilt rather than braking it.
         tilt_lim = float(self.max_tilt)
-        self.x_pid = PID(PIDGains(P=0.15, I=0.05, D=0.1, N=10.0,
+        self.x_pid = PID(PIDGains(P=0.15, I=0.03, D=0.0,
                                   lower=-tilt_lim, upper=tilt_lim))
-        self.y_pid = PID(PIDGains(P=0.15, I=0.05, D=0.1, N=10.0,
+        self.y_pid = PID(PIDGains(P=0.15, I=0.03, D=0.0,
                                   lower=-tilt_lim, upper=tilt_lim))
+
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _att_ref_from_xy(self, pos_xy, s_xy):
-        """XY PID -> desired [pitch, roll] angles (rad).
+    def _att_ref_from_xy(self, pos_xy, vel_xy, s_xy):
+        """XY PI + velocity damping -> desired [pitch, roll] angles (rad).
+
+        Tilt command = clip(P*error + I_state - kv*velocity,  ±max_tilt)
+
+        Using true state velocity as the damping signal (not a filtered error
+        derivative) gives clean, noise-free deceleration.
 
         Sign convention (verified from linear_accel() in quad_model.py):
-            +roll  (theta[1]) -> -x acceleration  => desired_roll  = -x_pid_output
-            +pitch (theta[0]) -> +y acceleration  => desired_pitch = +y_pid_output
+            +roll  (theta[1]) -> -x acceleration  => desired_roll  = -(x_pi - kv*vx)
+            +pitch (theta[0]) -> +y acceleration  => desired_pitch =  (y_pi - kv*vy)
 
         Returns (att_ref_rad (3,), ds_xy (4,)).
         """
         ex = self.xy_ref[0] - pos_xy[0]
         ey = self.xy_ref[1] - pos_xy[1]
+        vx, vy = float(vel_xy[0]), float(vel_xy[1])
 
-        x_pid_out, ds_x = self.x_pid.eval(ex, s_xy[0:2])
-        y_pid_out, ds_y = self.y_pid.eval(ey, s_xy[2:4])
+        x_pi_out, ds_x = self.x_pid.eval(ex, s_xy[0:2])
+        y_pi_out, ds_y = self.y_pid.eval(ey, s_xy[2:4])
 
-        desired_roll  = -x_pid_out   # negate: +roll -> -x
-        desired_pitch =  y_pid_out   # same sign: +pitch -> +y
+        # Subtract velocity damping then clip to tilt limit
+        raw_roll  = -(x_pi_out - self.kv_xy * vx)   # negate: +roll -> -x
+        raw_pitch =  (y_pi_out - self.kv_xy * vy)   # same sign: +pitch -> +y
+        desired_roll  = float(np.clip(raw_roll,  -self.max_tilt, self.max_tilt))
+        desired_pitch = float(np.clip(raw_pitch, -self.max_tilt, self.max_tilt))
 
-        # att_ref: [pitch, roll, yaw=0]
         att_ref = np.array([desired_pitch, desired_roll, 0.0])
         ds_xy   = np.concatenate([ds_x, ds_y])
         return att_ref, ds_xy
+
 
     def rate_setpoint(self, theta=None, att_ref_rad=None):
         """Rate setpoint = constant rate_ref + outer attitude P-loop contribution."""
@@ -204,7 +219,7 @@ class QuadController:
     # Pure (stateless) interface for the ODE solver
     # ------------------------------------------------------------------
 
-    def command(self, z, omega, s, theta=None, pos_xy=None):
+    def command(self, z, omega, s, theta=None, pos_xy=None, vel_xy=None):
         """Pure function — no internal state is mutated.
 
         Parameters
@@ -216,6 +231,8 @@ class QuadController:
                           s[8:12] -> XY PIDs (x, y)  — only used when xy_ref is set.
         theta   : (3,) | None   Current [pitch, roll, yaw] [rad].
         pos_xy  : (2,) | None   Current [x, y] position [m].
+        vel_xy  : (2,) | None   Current [vx, vy] velocity [m/s], used for damping.
+                                If None, velocity damping is skipped (pure PI only).
 
         Returns
         -------
@@ -229,7 +246,8 @@ class QuadController:
         att_ref_rad = None
         ds_xy = np.zeros(4)
         if self.xy_ref is not None and pos_xy is not None:
-            att_ref_rad, ds_xy = self._att_ref_from_xy(np.asarray(pos_xy), s_xy)
+            _vel = np.asarray(vel_xy, dtype=float) if vel_xy is not None else np.zeros(2)
+            att_ref_rad, ds_xy = self._att_ref_from_xy(np.asarray(pos_xy), _vel, s_xy)
 
         # --- Attitude P-loop (produces rate setpoint) ---
         w_ref = self.rate_setpoint(theta=theta, att_ref_rad=att_ref_rad)
