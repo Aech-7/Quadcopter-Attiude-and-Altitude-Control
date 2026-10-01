@@ -1,21 +1,37 @@
 """
-Controller ported from ControlAlgorithm.slx.
+Controller ported from ControlAlgorithm.slx, extended with an XY position loop.
 
-Structure (same as the Simulink diagram):
+Structure (full cascaded hierarchy):
 
-    z_ref (20) - z        -> PID_alt   -> throttle
-    (optional) att_ref - theta -> *kp_att -> added to the rate setpoints below
-    pitch_rate_ref - w[0] -> PID_pitch -> pitch cmd (clamped 0..100)
-    roll_rate_ref  - w[1] -> PID_roll  -> roll cmd  (clamped 0..100)
-    yaw_rate_ref   - w[2] -> PID_yaw   -> yaw cmd   (clamped 0..100)
-    (throttle, pitch, roll, yaw) -> mixer() -> 4 motor voltages
+    [NEW] xy_ref - pos_xy  -> PID_x / PID_y  -> desired pitch / roll angle (rad)
+                                                   |
+    att_ref (optional manual override) ----------->|  (xy loop wins when xy_ref is set)
+                                                   v
+    att_ref_rad - theta    -> *kp_att             -> rate_setpoint [pitch_rate, roll_rate, yaw_rate]
+    rate_setpoint - omega  -> PID_pitch / PID_roll / PID_yaw  -> cmd (clamped -50..+50)
+    z_ref - z              -> PID_alt                         -> throttle (clamped 0..100)
+    (throttle, pitch_cmd, roll_cmd, yaw_cmd) -> mixer() -> 4 motor voltages
+
+Angle conventions (from the Simulink Stateflow model, do NOT change):
+    theta = [pitch, roll, yaw]
+    pitch (theta[0]) drives  Y-axis force:  f2 = sin(pitch)*cos(roll)*T
+    roll  (theta[1]) drives  X-axis force:  f1 = sin(roll)*cos(pitch)*T
+    => x_pid output  -> desired ROLL  (theta[1])
+    => y_pid output  -> desired PITCH (theta[0])
+
+State vector (N_STATES = 12):
+    s[0:2]   altitude PID  [integrator, deriv-filter]
+    s[2:4]   pitch rate PID
+    s[4:6]   roll  rate PID
+    s[6:8]   yaw   rate PID
+    s[8:10]  x position PID   <- NEW
+    s[10:12] y position PID   <- NEW
 
 Two ways to use it:
-  * Pure/continuous:  voltages, ds = ctrl.command(z, omega, s)
-        -> for ODE solvers; you integrate the 8-vector of PID states `s` yourself.
-  * Stateful/discrete: voltages = ctrl.step(z, omega, dt)
-        -> for fixed-step simulators (PyBullet, MuJoCo, Gazebo, ...). Uses forward Euler
-           on the PID states, which is fine for dt <= ~2 ms given N = 100 rad/s.
+  * Pure/continuous:  voltages, ds = ctrl.command(z, omega, s, theta, pos_xy)
+        -> for ODE solvers; you integrate the 12-vector of PID states `s` yourself.
+  * Stateful/discrete: voltages = ctrl.step(z, omega, dt, theta, pos_xy)
+        -> for fixed-step simulators. Uses forward Euler on the PID states.
 """
 from dataclasses import dataclass
 import numpy as np
@@ -87,69 +103,171 @@ def mix(throttle, pitch, roll, yaw):
 
 
 class QuadController:
-    N_STATES = 8   # 4 PIDs x (integrator, filter)
+    # 4 inner PIDs × 2 states + 2 XY PIDs × 2 states
+    N_STATES = 12
 
     def __init__(self, z_ref=20.0, rate_ref=(0.0, 0.0, 0.0), tuned=True,
-                 att_ref_deg=None, kp_att=(4.0, 4.0, 0.7), max_rate=3.0):
-        """tuned=False reproduces ControlAlgorithm.slx exactly (unstable attitude at z_ref=20).
-        tuned=True applies the fixes described in the README/chat:
-          * throttle limited to 0..100 (stops the mixer's 'Correct' kick at t=0)
-          * rate PIDs limited to -50..+50 instead of 0..100 (they can brake in both directions)
-          * motor voltage clipped to 0..11.4 V
-          * altitude D = 10 (was 0.01) and gains 8/1/10 -> no overshoot
-          * yaw I = 2 (was 0.5) -> yaw rate settles in ~6 s instead of ~27 s
+                 att_ref_deg=None, kp_att=(4.0, 4.0, 0.7), max_rate=3.0,
+                 xy_ref=None, max_tilt_deg=20.0, kv_xy=0.4):
+        """
+        Parameters
+        ----------
+        z_ref        : float   Altitude setpoint [m].
+        rate_ref     : (3,)    Constant rate setpoint [rad/s] before attitude/xy override.
+        tuned        : bool    True = improved gains; False = original Simulink gains.
+        att_ref_deg  : (3,) | None
+                       Static attitude target [pitch, roll, yaw] in degrees.
+                       Ignored when xy_ref is set (xy loop takes over roll/pitch).
+        kp_att       : (3,)   Outer attitude P-gain [1/s] (angle error -> rate setpoint).
+        max_rate     : float   Clip on rate setpoints produced by attitude loop [rad/s].
+        xy_ref       : (2,) | None
+                       XY position setpoint [x_ref, y_ref] in metres.
+                       When set, the XY PIDs compute desired roll/pitch angles
+                       to drive the quad to that horizontal position.
+        max_tilt_deg : float   Hard limit on roll/pitch angle demanded by the XY loop [deg].
         """
         self.z_ref = z_ref
         self.rate_ref = np.asarray(rate_ref, dtype=float)
         self.tuned = tuned
-        # Optional outer attitude loop (angle error -> rate setpoint). Disabled when att_ref_deg is None.
-        # att_ref_deg = (pitch, roll, yaw) in degrees, same ordering as the model's theta.
-        self.att_ref = None if att_ref_deg is None else np.radians(np.asarray(att_ref_deg, dtype=float))
-        self.kp_att = np.asarray(kp_att, dtype=float)   # [1/s]
-        self.max_rate = max_rate                        # rate-setpoint limit [rad/s]
-        if tuned:
-            self.alt = PID(PIDGains(P=8.0, I=1.0, D=10.0, N=100.0, lower=0.0, upper=100.0))
-            self.pitch = PID(PIDGains(P=10.0, I=5.0, D=0.0, N=100.0, lower=-50.0, upper=50.0))
-            self.roll = PID(PIDGains(P=10.0, I=5.0, D=0.0, N=100.0, lower=-50.0, upper=50.0))
-            self.yaw = PID(PIDGains(P=5.0, I=2.0, D=0.0, N=100.0, lower=-50.0, upper=50.0))
-        else:
-            self.alt = PID(PIDGains(P=6.0, I=1.0, D=0.01, N=100.0))
-            self.pitch = PID(PIDGains(P=10.0, I=5.0, D=0.0, N=100.0, lower=0.0, upper=100.0))
-            self.roll = PID(PIDGains(P=10.0, I=5.0, D=0.0, N=100.0, lower=0.0, upper=100.0))
-            self.yaw = PID(PIDGains(P=5.0, I=0.5, D=0.0, N=100.0, lower=0.0, upper=100.0))
-        self._pids = (self.alt, self.pitch, self.roll, self.yaw)
 
-    def rate_setpoint(self, theta=None):
-        """Rate setpoint = constant rate_ref (+ outer attitude P-loop if att_ref is set)."""
+        # Attitude setpoint (used only when xy_ref is None)
+        self.att_ref = (None if att_ref_deg is None
+                        else np.radians(np.asarray(att_ref_deg, dtype=float)))
+        self.kp_att = np.asarray(kp_att, dtype=float)   # [1/s]
+        self.max_rate = max_rate                          # rate-setpoint clip [rad/s]
+
+        # XY position setpoint
+        self.xy_ref = None if xy_ref is None else np.asarray(xy_ref, dtype=float)
+        self.max_tilt = np.radians(max_tilt_deg)         # max tilt from XY loop [rad]
+
+        # ---- Inner rate / altitude PIDs (unchanged from original) ----
+        if tuned:
+            self.alt   = PID(PIDGains(P=8.0,  I=1.0, D=10.0, N=100.0, lower=0.0,   upper=100.0))
+            self.pitch = PID(PIDGains(P=10.0, I=5.0, D=0.0,  N=100.0, lower=-50.0, upper=50.0))
+            self.roll  = PID(PIDGains(P=10.0, I=5.0, D=0.0,  N=100.0, lower=-50.0, upper=50.0))
+            self.yaw   = PID(PIDGains(P=5.0,  I=2.0, D=0.0,  N=100.0, lower=-50.0, upper=50.0))
+        else:
+            self.alt   = PID(PIDGains(P=6.0,  I=1.0, D=0.01, N=100.0))
+            self.pitch = PID(PIDGains(P=10.0, I=5.0, D=0.0,  N=100.0, lower=0.0, upper=100.0))
+            self.roll  = PID(PIDGains(P=10.0, I=5.0, D=0.0,  N=100.0, lower=0.0, upper=100.0))
+            self.yaw   = PID(PIDGains(P=5.0,  I=0.5, D=0.0,  N=100.0, lower=0.0, upper=100.0))
+        self._inner_pids = (self.alt, self.pitch, self.roll, self.yaw)
+
+        # ---- Outer XY position PIDs ----
+        # Output = desired tilt angle [rad], clipped to ±max_tilt.
+        # Gains tuned for the plant (m=0.743 kg, drag area ~0.02 m²):
+        #   Bandwidth ~0.3 rad/s, well below the attitude loop (~5 rad/s).
+        #   D-term with moderate filter (N=10) to damp velocity without noise amplification.
+        tilt_lim = float(self.max_tilt)
+        self.x_pid = PID(PIDGains(P=0.15, I=0.05, D=0.1, N=10.0,
+                                  lower=-tilt_lim, upper=tilt_lim))
+        self.y_pid = PID(PIDGains(P=0.15, I=0.05, D=0.1, N=10.0,
+                                  lower=-tilt_lim, upper=tilt_lim))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _att_ref_from_xy(self, pos_xy, s_xy):
+        """XY PID -> desired [pitch, roll] angles (rad).
+
+        Sign convention (verified from linear_accel() in quad_model.py):
+            +roll  (theta[1]) -> -x acceleration  => desired_roll  = -x_pid_output
+            +pitch (theta[0]) -> +y acceleration  => desired_pitch = +y_pid_output
+
+        Returns (att_ref_rad (3,), ds_xy (4,)).
+        """
+        ex = self.xy_ref[0] - pos_xy[0]
+        ey = self.xy_ref[1] - pos_xy[1]
+
+        x_pid_out, ds_x = self.x_pid.eval(ex, s_xy[0:2])
+        y_pid_out, ds_y = self.y_pid.eval(ey, s_xy[2:4])
+
+        desired_roll  = -x_pid_out   # negate: +roll -> -x
+        desired_pitch =  y_pid_out   # same sign: +pitch -> +y
+
+        # att_ref: [pitch, roll, yaw=0]
+        att_ref = np.array([desired_pitch, desired_roll, 0.0])
+        ds_xy   = np.concatenate([ds_x, ds_y])
+        return att_ref, ds_xy
+
+    def rate_setpoint(self, theta=None, att_ref_rad=None):
+        """Rate setpoint = constant rate_ref + outer attitude P-loop contribution."""
         r = self.rate_ref.copy()
-        if self.att_ref is not None and theta is not None:
-            r = r + np.clip(self.kp_att * (self.att_ref - np.asarray(theta)),
+        ref = att_ref_rad if att_ref_rad is not None else self.att_ref
+        if ref is not None and theta is not None:
+            r = r + np.clip(self.kp_att * (ref - np.asarray(theta)),
                             -self.max_rate, self.max_rate)
         return r
 
-    def command(self, z, omega, s, theta=None):
-        """Pure function. omega = [pitch_rate, roll_rate, yaw_rate] (rad/s),
-        theta = [pitch, roll, yaw] (rad, only needed for the attitude loop).
-        s: array(8). Returns (voltages(4), ds(8))."""
-        errs = (self.z_ref - z, *(self.rate_setpoint(theta) - np.asarray(omega)))
-        u, ds = [], []
-        for k, (pid, e) in enumerate(zip(self._pids, errs)):
-            uk, dsk = pid.eval(e, s[2 * k: 2 * k + 2])
+    # ------------------------------------------------------------------
+    # Pure (stateless) interface for the ODE solver
+    # ------------------------------------------------------------------
+
+    def command(self, z, omega, s, theta=None, pos_xy=None):
+        """Pure function — no internal state is mutated.
+
+        Parameters
+        ----------
+        z       : float   Current altitude [m].
+        omega   : (3,)    Current angular rates [pitch_rate, roll_rate, yaw_rate] [rad/s].
+        s       : (12,)   Full PID state vector.
+                          s[0:8]  -> inner PIDs (alt, pitch, roll, yaw)
+                          s[8:12] -> XY PIDs (x, y)  — only used when xy_ref is set.
+        theta   : (3,) | None   Current [pitch, roll, yaw] [rad].
+        pos_xy  : (2,) | None   Current [x, y] position [m].
+
+        Returns
+        -------
+        voltages : (4,)   Motor voltages [V].
+        ds       : (12,)  Derivative of full state vector.
+        """
+        s_inner = s[0:8]
+        s_xy    = s[8:12]
+
+        # --- Outer XY loop (produces att_ref_rad) ---
+        att_ref_rad = None
+        ds_xy = np.zeros(4)
+        if self.xy_ref is not None and pos_xy is not None:
+            att_ref_rad, ds_xy = self._att_ref_from_xy(np.asarray(pos_xy), s_xy)
+
+        # --- Attitude P-loop (produces rate setpoint) ---
+        w_ref = self.rate_setpoint(theta=theta, att_ref_rad=att_ref_rad)
+
+        # --- Inner PIDs ---
+        errs = (self.z_ref - z, *(w_ref - np.asarray(omega)))
+        u, ds_inner = [], []
+        for k, (pid, e) in enumerate(zip(self._inner_pids, errs)):
+            uk, dsk = pid.eval(e, s_inner[2 * k: 2 * k + 2])
             u.append(uk)
-            ds.append(dsk)
+            ds_inner.append(dsk)
+
         v = mix(*u)
         if self.tuned:
             v = np.clip(v, 0.0, 11.4)
-        return v, np.concatenate(ds)
 
-    def step(self, z, omega, dt, theta=None):
+        ds = np.concatenate([*ds_inner, ds_xy])
+        return v, ds
+
+    # ------------------------------------------------------------------
+    # Stateful (discrete) interface for fixed-step simulators
+    # ------------------------------------------------------------------
+
+    def step(self, z, omega, dt, theta=None, pos_xy=None):
         """Stateful fixed-step version (forward Euler on PID states)."""
-        s = np.concatenate([p.s for p in self._pids])
-        v, ds = self.command(z, omega, s, theta)
-        for k, p in enumerate(self._pids):
+        s = np.concatenate([p.s for p in self._inner_pids]
+                           + [self.x_pid.s, self.y_pid.s])
+        v, ds = self.command(z, omega, s, theta, pos_xy)
+        # Update inner PIDs
+        for k, p in enumerate(self._inner_pids):
             p.s = p.s + dt * ds[2 * k: 2 * k + 2]
+        # Update XY PIDs
+        self.x_pid.s = self.x_pid.s + dt * ds[8:10]
+        self.y_pid.s = self.y_pid.s + dt * ds[10:12]
         return v
 
     def reset(self):
-        for p in self._pids:
+        for p in self._inner_pids:
             p.s = np.zeros(2)
+        self.x_pid.s = np.zeros(2)
+        self.y_pid.s = np.zeros(2)

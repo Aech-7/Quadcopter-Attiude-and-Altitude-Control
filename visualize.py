@@ -2,13 +2,13 @@
 Simple 3D visualizer for the quadcopter simulation.
 
 Usage (from the folder with the other files):
-    python visualize.py                  # setpoint 20 m, opens a window
-    python visualize.py --zref 5         # different altitude setpoint
+    python visualize.py                       # hover at z=10 m, xy=(0,0)
+    python visualize.py --zref 5              # different altitude setpoint
+    python visualize.py --xy 5 3              # fly to x=5, y=3 while holding z=10
     python visualize.py --tend 30 --speed 2
-    python visualize.py --save run.gif   # write a GIF instead of opening a window
+    python visualize.py --save run.gif        # write a GIF instead of opening a window
 
-Needs only numpy / scipy / matplotlib. Imports the simulation from run_reference.py
-(or run.py, if you renamed it).
+Needs only numpy / scipy / matplotlib.
 """
 import argparse
 import numpy as np
@@ -37,17 +37,29 @@ def rot(theta):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--zref", type=float, default=20.0, help="altitude setpoint [m]")
-    ap.add_argument("--tend", type=float, default=100.0, help="simulation length [s]")
-    ap.add_argument("--speed", type=float, default=1.0, help="playback speed (1 = real time)")
-    ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--att", type=float, nargs=3, default=(0, 10, 0), metavar=("PITCH", "ROLL", "YAW"),
-                    help="attitude target in degrees, e.g. --att 0 10 0")
+    ap.add_argument("--zref",  type=float, default=10.0, help="altitude setpoint [m]")
+    ap.add_argument("--xy",    type=float, nargs=2,      default=(10, 10),
+                    metavar=("X", "Y"),
+                    help="XY position setpoint [m], e.g. --xy 5 3.  "
+                         "Enables the position controller.  Default: hover at (0,0).")
+    ap.add_argument("--tend",  type=float, default=30.0, help="simulation length [s]")
+    ap.add_argument("--speed", type=float, default=1.0,  help="playback speed (1 = real time)")
+    ap.add_argument("--fps",   type=int,   default=30)
+    ap.add_argument("--att",   type=float, nargs=3, default=(0, 0, 10),
+                    metavar=("PITCH", "ROLL", "YAW"),
+                    help="static attitude target in degrees (ignored when --xy is given)")
     ap.add_argument("--legacy", action="store_true", help="original (unstable) Simulink gains/limits")
-    ap.add_argument("--save", type=str, default=None, help="output .gif instead of a window")
+    ap.add_argument("--save",  type=str,   default=None, help="output .gif instead of a window")
     a = ap.parse_args()
 
-    rr.CTRL = QuadController(z_ref=a.zref, tuned=not a.legacy, att_ref_deg=a.att)
+    # --xy overrides --att: when a position setpoint is given the XY PID loop
+    # drives pitch/roll, so a manual att target would fight it.
+    rr.CTRL = QuadController(
+        z_ref=a.zref,
+        tuned=not a.legacy,
+        att_ref_deg=None if a.xy is not None else a.att,
+        xy_ref=a.xy,
+    )
     sol = rr.run(t_end=a.tend, dt_out=0.01)
     t, x = sol.t, sol.y.T
     pos, th = x[:, 0:3], x[:, 6:9]
@@ -56,9 +68,9 @@ def main():
     step = max(1, int(round(a.speed / a.fps / 0.01)))
     idx = np.arange(0, len(t), step)
 
-    # axis limits (equal scale) and an exaggerated drawing size for the quad
+    # axis limits — centred on the trajectory, with a sensible minimum span
     lo = np.minimum(pos.min(0), [-1, -1, 0])
-    hi = np.maximum(pos.max(0), [1, 1, 1])
+    hi = np.maximum(pos.max(0), [1,  1,  1])
     c, span = (lo + hi) / 2, max((hi - lo).max(), 2.0) * 1.1
     L = span * 0.06                                   # drawn arm length
     motors_body = L / np.sqrt(2) * np.array([[-1, -1, 0], [-1, 1, 0], [1, 1, 0], [1, -1, 0]])
@@ -72,14 +84,22 @@ def main():
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_zlabel("z [m]")
     ax.set_box_aspect((1, 1, 1))
 
-    # setpoint marker + ground shadow
-    ax.plot([0], [0], [a.zref], "k+", ms=12, label=f"z_ref = {a.zref:g} m")
-    trail, = ax.plot([], [], [], "-", c="gray", lw=1)
-    shadow, = ax.plot([], [], [], "o", c="lightgray", ms=6)
-    arm1, = ax.plot([], [], [], "-", c="k", lw=2)
-    arm2, = ax.plot([], [], [], "-", c="k", lw=2)
+    # setpoint marker(s)
+    if a.xy is not None:
+        ax.plot([a.xy[0]], [a.xy[1]], [a.zref], "k+", ms=14, zorder=5,
+                label=f"target ({a.xy[0]:g},{a.xy[1]:g},{a.zref:g}) m")
+        # vertical dashed line from ground to setpoint for clarity
+        ax.plot([a.xy[0], a.xy[0]], [a.xy[1], a.xy[1]], [0, a.zref],
+                "--", c="gray", lw=1, alpha=0.6)
+    else:
+        ax.plot([0], [0], [a.zref], "k+", ms=12, label=f"z_ref = {a.zref:g} m")
+
+    trail,  = ax.plot([], [], [], "-",  c="gray",      lw=1)
+    shadow, = ax.plot([], [], [], "o",  c="lightgray",  ms=6)
+    arm1,   = ax.plot([], [], [], "-",  c="k",          lw=2)
+    arm2,   = ax.plot([], [], [], "-",  c="k",          lw=2)
     dots = [ax.plot([], [], [], "o", c=col, ms=8)[0] for col in colors]
-    nose, = ax.plot([], [], [], "-", c="m", lw=3)     # short line along body +x ("front")
+    nose,   = ax.plot([], [], [], "-",  c="m",          lw=3)
     txt = ax.text2D(0.02, 0.95, "", transform=ax.transAxes, family="monospace")
     ax.legend(loc="upper right")
 
@@ -96,8 +116,9 @@ def main():
         trail.set_data_3d(pos[: i + 1, 0], pos[: i + 1, 1], pos[: i + 1, 2])
         shadow.set_data_3d([p[0]], [p[1]], [0])
         d3 = np.degrees(th[i])
-        txt.set_text(f"t = {t[i]:6.2f} s\nz = {p[2]:6.2f} m\n"
-                     f"pitch/roll/yaw = {d3[0]:.0f}/{d3[1]:.0f}/{d3[2]:.0f} deg")
+        xy_str = (f"\nx = {p[0]:6.2f} m  y = {p[1]:6.2f} m" if a.xy is not None else "")
+        txt.set_text(f"t = {t[i]:6.2f} s\nz = {p[2]:6.2f} m{xy_str}\n"
+                     f"pitch/roll/yaw = {d3[0]:.1f}/{d3[1]:.1f}/{d3[2]:.1f} deg")
         return []
 
     anim = FuncAnimation(fig, update, frames=len(idx), interval=1000 / a.fps, blit=False)
