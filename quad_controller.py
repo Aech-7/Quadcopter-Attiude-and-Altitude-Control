@@ -108,7 +108,7 @@ class QuadController:
 
     def __init__(self, z_ref=20.0, rate_ref=(0.0, 0.0, 0.0), tuned=True,
                  att_ref_deg=None, kp_att=(4.0, 4.0, 0.7), max_rate=3.0,
-                 xy_ref=None, max_tilt_deg=20.0, kv_xy=0.2):
+                 xy_ref=None, max_tilt_deg=10.0, kv_xy=0.2):
         """
         Parameters
         ----------
@@ -201,9 +201,13 @@ class QuadController:
         desired_roll  = float(np.clip(raw_roll,  -self.max_tilt, self.max_tilt))
         desired_pitch = float(np.clip(raw_pitch, -self.max_tilt, self.max_tilt))
 
-        att_ref = np.array([desired_pitch, desired_roll, 0.0])
+        # Yaw: use self.att_ref yaw if an attitude target was also set, else 0
+        desired_yaw = float(self.att_ref[2]) if self.att_ref is not None else 0.0
+
+        att_ref = np.array([desired_pitch, desired_roll, desired_yaw])
         ds_xy   = np.concatenate([ds_x, ds_y])
         return att_ref, ds_xy
+
 
 
     def rate_setpoint(self, theta=None, att_ref_rad=None):
@@ -271,11 +275,11 @@ class QuadController:
     # Stateful (discrete) interface for fixed-step simulators
     # ------------------------------------------------------------------
 
-    def step(self, z, omega, dt, theta=None, pos_xy=None):
+    def step(self, z, omega, dt, theta=None, pos_xy=None, vel_xy=None):
         """Stateful fixed-step version (forward Euler on PID states)."""
         s = np.concatenate([p.s for p in self._inner_pids]
                            + [self.x_pid.s, self.y_pid.s])
-        v, ds = self.command(z, omega, s, theta, pos_xy)
+        v, ds = self.command(z, omega, s, theta, pos_xy, vel_xy)
         # Update inner PIDs
         for k, p in enumerate(self._inner_pids):
             p.s = p.s + dt * ds[2 * k: 2 * k + 2]

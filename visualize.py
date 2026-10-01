@@ -2,13 +2,16 @@
 Simple 3D visualizer for the quadcopter simulation.
 
 Usage (from the folder with the other files):
-    python visualize.py                       # hover at z=10 m, xy=(0,0)
+    python visualize.py                       # hover at z=10 m
     python visualize.py --zref 5              # different altitude setpoint
+    python visualize.py --att 0 15 0          # hold 15 deg roll (drifts sideways)
     python visualize.py --xy 5 3              # fly to x=5, y=3 while holding z=10
+    python visualize.py --xy 5 3 --att 0 0 30 # fly to (5,3) and rotate yaw 30 deg
     python visualize.py --tend 30 --speed 2
     python visualize.py --save run.gif        # write a GIF instead of opening a window
 
-Needs only numpy / scipy / matplotlib.
+The camera always follows the quad (fixed-size window centred on current position),
+so the quad is always visible regardless of how far it drifts.
 """
 import argparse
 import numpy as np
@@ -17,7 +20,7 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 
 try:
     import run as rr
-except ImportError:          # you renamed it
+except ImportError:
     import run as rr
 from quad_controller import QuadController
 
@@ -38,26 +41,27 @@ def rot(theta):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--zref",  type=float, default=10.0, help="altitude setpoint [m]")
-    ap.add_argument("--xy",    type=float, nargs=2,      default=(0, 0),
+    ap.add_argument("--xy",    type=float, nargs=2, default=(10, 10),
                     metavar=("X", "Y"),
-                    help="XY position setpoint [m], e.g. --xy 5 3.  "
-                         "Enables the position controller.  Default: hover at (0,0).")
+                    help="XY position setpoint [m], e.g. --xy 5 3. "
+                         "Enables the XY position controller.")
     ap.add_argument("--tend",  type=float, default=30.0, help="simulation length [s]")
     ap.add_argument("--speed", type=float, default=1.0,  help="playback speed (1 = real time)")
     ap.add_argument("--fps",   type=int,   default=30)
-    ap.add_argument("--att",   type=float, nargs=3, default=(0, 0, 360),
+    ap.add_argument("--att",   type=float, nargs=3, default=(0,0,0),
                     metavar=("PITCH", "ROLL", "YAW"),
-                    help="static attitude target in degrees (ignored when --xy is given)")
-    ap.add_argument("--legacy", action="store_true", help="original (unstable) Simulink gains/limits")
-    ap.add_argument("--save",  type=str,   default=None, help="output .gif instead of a window")
+                    help="attitude target [deg]. When --xy is also given, only yaw is used "
+                         "(XY controller commands pitch/roll). Default: (0,0,0).")
+    ap.add_argument("--legacy", action="store_true", help="original (unstable) Simulink gains")
+    ap.add_argument("--save",  type=str, default=None, help="output .gif instead of a window")
     a = ap.parse_args()
 
-    # --xy overrides --att: when a position setpoint is given the XY PID loop
-    # drives pitch/roll, so a manual att target would fight it.
+    # When --xy is active: XY PID drives pitch/roll, att_ref only contributes yaw.
+    # When --xy is absent: att_ref controls all three axes.
     rr.CTRL = QuadController(
         z_ref=a.zref,
         tuned=not a.legacy,
-        att_ref_deg=None if a.xy is not None else a.att,
+        att_ref_deg=a.att,
         xy_ref=a.xy,
     )
     sol = rr.run(t_end=a.tend, dt_out=0.01)
@@ -68,45 +72,54 @@ def main():
     step = max(1, int(round(a.speed / a.fps / 0.01)))
     idx = np.arange(0, len(t), step)
 
-    # axis limits — centred on the trajectory, with a sensible minimum span
-    lo = np.minimum(pos.min(0), [-1, -1, 0])
-    hi = np.maximum(pos.max(0), [1,  1,  1])
-    c, span = (lo + hi) / 2, max((hi - lo).max(), 2.0) * 1.1
-    L = span * 0.06                                   # drawn arm length
-    motors_body = L / np.sqrt(2) * np.array([[-1, -1, 0], [-1, 1, 0], [1, 1, 0], [1, -1, 0]])
-    colors = ["tab:red", "tab:blue", "tab:green", "tab:orange"]   # motors 1..4
+    # --- Follow-cam window ---
+    # Fixed-size view centred on the quad's current position each frame.
+    # Span is set just large enough to comfortably show the quad and target.
+    if a.xy is not None:
+        dist = np.hypot(a.xy[0], a.xy[1])          # distance to XY target
+        span = max(dist * 1.4, a.zref * 1.5, 6.0)  # wide enough to include target
+    else:
+        span = max(a.zref * 1.5, 6.0)              # altitude-relative window
+
+    L = span * 0.07          # drawn arm length (scales with view)
+    motors_body = L / np.sqrt(2) * np.array([[-1,-1,0],[-1,1,0],[1,1,0],[1,-1,0]])
+    colors = ["tab:red", "tab:blue", "tab:green", "tab:orange"]
 
     fig = plt.figure(figsize=(8, 7))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_xlim(c[0] - span / 2, c[0] + span / 2)
-    ax.set_ylim(c[1] - span / 2, c[1] + span / 2)
-    ax.set_zlim(max(0, c[2] - span / 2), max(0, c[2] - span / 2) + span)
+    ax  = fig.add_subplot(111, projection="3d")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_zlabel("z [m]")
     ax.set_box_aspect((1, 1, 1))
 
-    # setpoint marker(s)
+    # Setpoint marker
     if a.xy is not None:
         ax.plot([a.xy[0]], [a.xy[1]], [a.zref], "k+", ms=14, zorder=5,
-                label=f"target ({a.xy[0]:g},{a.xy[1]:g},{a.zref:g}) m")
-        # vertical dashed line from ground to setpoint for clarity
+                label=f"target ({a.xy[0]:g}, {a.xy[1]:g}, {a.zref:g}) m")
         ax.plot([a.xy[0], a.xy[0]], [a.xy[1], a.xy[1]], [0, a.zref],
-                "--", c="gray", lw=1, alpha=0.6)
+                "--", c="gray", lw=1, alpha=0.5)
     else:
         ax.plot([0], [0], [a.zref], "k+", ms=12, label=f"z_ref = {a.zref:g} m")
 
-    trail,  = ax.plot([], [], [], "-",  c="gray",      lw=1)
-    shadow, = ax.plot([], [], [], "o",  c="lightgray",  ms=6)
-    arm1,   = ax.plot([], [], [], "-",  c="k",          lw=2)
-    arm2,   = ax.plot([], [], [], "-",  c="k",          lw=2)
+    trail,  = ax.plot([], [], [], "-",  c="gray",     lw=1)
+    shadow, = ax.plot([], [], [], "o",  c="lightgray", ms=6)
+    arm1,   = ax.plot([], [], [], "-",  c="k",         lw=2)
+    arm2,   = ax.plot([], [], [], "-",  c="k",         lw=2)
     dots = [ax.plot([], [], [], "o", c=col, ms=8)[0] for col in colors]
-    nose,   = ax.plot([], [], [], "-",  c="m",          lw=3)
+    nose,   = ax.plot([], [], [], "-",  c="m",         lw=3)
     txt = ax.text2D(0.02, 0.95, "", transform=ax.transAxes, family="monospace")
     ax.legend(loc="upper right")
 
     def update(k):
-        i = idx[k]
+        i   = idx[k]
         R, p = rot(th[i]), pos[i]
-        w = (R @ motors_body.T).T + p                 # world positions of the 4 motors
+        w   = (R @ motors_body.T).T + p          # world positions of the 4 motors
+
+        # --- Follow-cam: re-centre axes on current quad position every frame ---
+        cx, cy, cz = p[0], p[1], max(p[2], span / 2)
+        ax.set_xlim(cx - span / 2, cx + span / 2)
+        ax.set_ylim(cy - span / 2, cy + span / 2)
+        ax.set_zlim(max(0, cz - span / 2), max(0, cz - span / 2) + span)
+
+        # Draw quad body
         arm1.set_data_3d(*zip(w[0], w[2]))
         arm2.set_data_3d(*zip(w[1], w[3]))
         for d, q in zip(dots, w):
@@ -115,6 +128,8 @@ def main():
         nose.set_data_3d(front[:, 0], front[:, 1], front[:, 2])
         trail.set_data_3d(pos[: i + 1, 0], pos[: i + 1, 1], pos[: i + 1, 2])
         shadow.set_data_3d([p[0]], [p[1]], [0])
+
+        # HUD text
         d3 = np.degrees(th[i])
         xy_str = (f"\nx = {p[0]:6.2f} m  y = {p[1]:6.2f} m" if a.xy is not None else "")
         txt.set_text(f"t = {t[i]:6.2f} s\nz = {p[2]:6.2f} m{xy_str}\n"
