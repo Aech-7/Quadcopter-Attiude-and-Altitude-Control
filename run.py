@@ -9,7 +9,7 @@ State vector x (20):
     12:20 PID states          (altitude, pitch, roll, yaw: [integrator, filter])
 
 Simulink settings reproduced: stop time 100 s, stiff variable-step solver (ode15s -> BDF),
-rtol 1e-3 in Simulink; tighter here so this is a good "truth" to compare other simulators to.
+rtol 1e-3 in Simulink; tighter here (explicit RK45 here, see run()) so this is a good "truth" to compare other simulators to.
 """
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -18,7 +18,7 @@ from quad_model import QuadParams, motor_model, rotational_accel, linear_accel, 
 from quad_controller import QuadController
 
 P = QuadParams()
-CTRL = QuadController(z_ref=20.0, rate_ref=(0.0, 10.0, 0.0))
+CTRL = QuadController(z_ref=20.0, rate_ref=(0.0, 0.0, 0.0))
 
 
 def wind_gusts(t):
@@ -35,10 +35,14 @@ def rhs(t, x):
     return np.concatenate([vel, lin_acc, om, ang_acc, ds])
 
 
-def run(t_end=100.0, dt_out=0.01):
+def run(t_end=100.0, dt_out=0.01, method="RK45"):
+    """RK45 (explicit) is used on purpose: the controller has hard saturations (throttle clip,
+    voltage clip, PID clamping, mixer 'if's). Those kinks make the *numerical Jacobian* of the
+    stiff solvers (BDF/Radau) overflow when the motors are saturated at t=0 (e.g. z_ref=20).
+    max_step=0.01 keeps the fast PID filter (N=100 rad/s) stable."""
     t_eval = np.arange(0.0, t_end + dt_out / 2, dt_out)
-    sol = solve_ivp(rhs, (0.0, t_end), np.zeros(20), method="BDF",
-                    t_eval=t_eval, rtol=1e-6, atol=1e-8, max_step=0.05)
+    sol = solve_ivp(rhs, (0.0, t_end), np.zeros(20), method=method,
+                    t_eval=t_eval, rtol=1e-6, atol=1e-8, max_step=0.01)
     return sol
 
 

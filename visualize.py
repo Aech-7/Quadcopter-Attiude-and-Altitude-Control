@@ -24,12 +24,14 @@ from quad_controller import QuadController
 
 def rot(theta):
     """Body->world rotation for the model's angle ordering [pitch, roll, yaw].
-    Chosen so the body z-axis tilts the same way the model's thrust vector does
-    (roll tilts toward +x, pitch toward +y); yaw is about world z."""
+    Chosen so the drawn body z-axis tilts the way the model's thrust vector pushes the quad:
+    positive pitch -> +y, positive roll -> -x, positive yaw = clockwise seen from above
+    (that is what the Stateflow thrust-vector code does)."""
     t1, t2, t3 = theta
-    Rx = np.array([[1, 0, 0], [0, np.cos(-t1), -np.sin(-t1)], [0, np.sin(-t1), np.cos(-t1)]])
-    Ry = np.array([[np.cos(t2), 0, np.sin(t2)], [0, 1, 0], [-np.sin(t2), 0, np.cos(t2)]])
-    Rz = np.array([[np.cos(t3), -np.sin(t3), 0], [np.sin(t3), np.cos(t3), 0], [0, 0, 1]])
+    a, b, c = -t1, -t2, -t3
+    Rx = np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+    Ry = np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
+    Rz = np.array([[np.cos(c), -np.sin(c), 0], [np.sin(c), np.cos(c), 0], [0, 0, 1]])
     return Rz @ Rx @ Ry
 
 
@@ -39,7 +41,7 @@ def main():
     ap.add_argument("--tend", type=float, default=100.0, help="simulation length [s]")
     ap.add_argument("--speed", type=float, default=1.0, help="playback speed (1 = real time)")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--att", type=float, nargs=3, default=(1, 0, 0), metavar=("PITCH", "ROLL", "YAW"),
+    ap.add_argument("--att", type=float, nargs=3, default=(0, 10, 0), metavar=("PITCH", "ROLL", "YAW"),
                     help="attitude target in degrees, e.g. --att 0 10 0")
     ap.add_argument("--legacy", action="store_true", help="original (unstable) Simulink gains/limits")
     ap.add_argument("--save", type=str, default=None, help="output .gif instead of a window")
