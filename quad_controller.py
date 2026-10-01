@@ -3,7 +3,8 @@ Controller ported from ControlAlgorithm.slx.
 
 Structure (same as the Simulink diagram):
 
-    z_ref (20) - z        -> PID_alt   -> throttle  (unsaturated)
+    z_ref (20) - z        -> PID_alt   -> throttle
+    (optional) att_ref - theta -> *kp_att -> added to the rate setpoints below
     pitch_rate_ref - w[0] -> PID_pitch -> pitch cmd (clamped 0..100)
     roll_rate_ref  - w[1] -> PID_roll  -> roll cmd  (clamped 0..100)
     yaw_rate_ref   - w[2] -> PID_yaw   -> yaw cmd   (clamped 0..100)
@@ -88,7 +89,8 @@ def mix(throttle, pitch, roll, yaw):
 class QuadController:
     N_STATES = 8   # 4 PIDs x (integrator, filter)
 
-    def __init__(self, z_ref=20.0, rate_ref=(0.0, 0.0, 0.0), tuned=True):
+    def __init__(self, z_ref=20.0, rate_ref=(0.0, 0.0, 0.0), tuned=True,
+                 att_ref_deg=None, kp_att=(4.0, 4.0, 0.7), max_rate=3.0):
         """tuned=False reproduces ControlAlgorithm.slx exactly (unstable attitude at z_ref=20).
         tuned=True applies the fixes described in the README/chat:
           * throttle limited to 0..100 (stops the mixer's 'Correct' kick at t=0)
@@ -100,6 +102,11 @@ class QuadController:
         self.z_ref = z_ref
         self.rate_ref = np.asarray(rate_ref, dtype=float)
         self.tuned = tuned
+        # Optional outer attitude loop (angle error -> rate setpoint). Disabled when att_ref_deg is None.
+        # att_ref_deg = (pitch, roll, yaw) in degrees, same ordering as the model's theta.
+        self.att_ref = None if att_ref_deg is None else np.radians(np.asarray(att_ref_deg, dtype=float))
+        self.kp_att = np.asarray(kp_att, dtype=float)   # [1/s]
+        self.max_rate = max_rate                        # rate-setpoint limit [rad/s]
         if tuned:
             self.alt = PID(PIDGains(P=8.0, I=1.0, D=10.0, N=100.0, lower=0.0, upper=100.0))
             self.pitch = PID(PIDGains(P=10.0, I=5.0, D=0.0, N=100.0, lower=-50.0, upper=50.0))
@@ -112,10 +119,19 @@ class QuadController:
             self.yaw = PID(PIDGains(P=5.0, I=0.5, D=0.0, N=100.0, lower=0.0, upper=100.0))
         self._pids = (self.alt, self.pitch, self.roll, self.yaw)
 
-    def command(self, z, omega, s):
-        """Pure function. omega = [pitch_rate, roll_rate, yaw_rate] (rad/s).
+    def rate_setpoint(self, theta=None):
+        """Rate setpoint = constant rate_ref (+ outer attitude P-loop if att_ref is set)."""
+        r = self.rate_ref.copy()
+        if self.att_ref is not None and theta is not None:
+            r = r + np.clip(self.kp_att * (self.att_ref - np.asarray(theta)),
+                            -self.max_rate, self.max_rate)
+        return r
+
+    def command(self, z, omega, s, theta=None):
+        """Pure function. omega = [pitch_rate, roll_rate, yaw_rate] (rad/s),
+        theta = [pitch, roll, yaw] (rad, only needed for the attitude loop).
         s: array(8). Returns (voltages(4), ds(8))."""
-        errs = (self.z_ref - z, *(self.rate_ref - np.asarray(omega)))
+        errs = (self.z_ref - z, *(self.rate_setpoint(theta) - np.asarray(omega)))
         u, ds = [], []
         for k, (pid, e) in enumerate(zip(self._pids, errs)):
             uk, dsk = pid.eval(e, s[2 * k: 2 * k + 2])
@@ -126,10 +142,10 @@ class QuadController:
             v = np.clip(v, 0.0, 11.4)
         return v, np.concatenate(ds)
 
-    def step(self, z, omega, dt):
+    def step(self, z, omega, dt, theta=None):
         """Stateful fixed-step version (forward Euler on PID states)."""
         s = np.concatenate([p.s for p in self._pids])
-        v, ds = self.command(z, omega, s)
+        v, ds = self.command(z, omega, s, theta)
         for k, p in enumerate(self._pids):
             p.s = p.s + dt * ds[2 * k: 2 * k + 2]
         return v

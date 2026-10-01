@@ -18,7 +18,7 @@ from quad_model import QuadParams, motor_model, rotational_accel, linear_accel, 
 from quad_controller import QuadController
 
 P = QuadParams()
-CTRL = QuadController(z_ref=50.0, rate_ref=(0.0, 0.0, 0.0))
+CTRL = QuadController(z_ref=20.0, rate_ref=(0.0, 10.0, 0.0))
 
 
 def wind_gusts(t):
@@ -28,7 +28,7 @@ def wind_gusts(t):
 
 def rhs(t, x):
     pos, vel, th, om, s = x[0:3], x[3:6], x[6:9], x[9:12], x[12:20]
-    V, ds = CTRL.command(z=pos[2], omega=om, s=s)
+    V, ds = CTRL.command(z=pos[2], omega=om, s=s, theta=th)
     torque, F, _ = motor_model(V, P)
     ang_acc = rotational_accel(torque, F, P)
     lin_acc = linear_accel(F, gust_force(wind_gusts(t), P), th, vel, P)
@@ -44,9 +44,12 @@ def run(t_end=100.0, dt_out=0.01):
 
 if __name__ == "__main__":
     import sys
-    # python run_reference.py [z_ref] [--legacy]   (--legacy = original, unstable Simulink behaviour)
+    # python run_reference.py [z_ref] [--att=pitch,roll,yaw] [--legacy]
+    #   --att in degrees, e.g. --att=0,10,0 ; --legacy = original, unstable Simulink behaviour
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    CTRL = QuadController(z_ref=float(args[0]) if args else 50.0, tuned="--legacy" not in sys.argv)
+    att = next((tuple(float(v) for v in a[6:].split(",")) for a in sys.argv if a.startswith("--att=")), None)
+    CTRL = QuadController(z_ref=float(args[0]) if args else 20.0, tuned="--legacy" not in sys.argv,
+                          att_ref_deg=att)
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -56,7 +59,7 @@ if __name__ == "__main__":
     pos, th = x[:, 0:3], np.degrees(x[:, 6:9])
 
     # recompute voltages for plotting
-    volt = np.array([CTRL.command(xi[2], xi[9:12], xi[12:20])[0] for xi in x])
+    volt = np.array([CTRL.command(xi[2], xi[9:12], xi[12:20], xi[6:9])[0] for xi in x])
 
     # Equivalent of the To Workspace block 'PositionVector'
     np.savetxt("position_vector.csv", np.column_stack([t, pos]),

@@ -35,15 +35,17 @@ def rot(theta):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--zref", type=float, default=50.0, help="altitude setpoint [m]")
+    ap.add_argument("--zref", type=float, default=20.0, help="altitude setpoint [m]")
     ap.add_argument("--tend", type=float, default=100.0, help="simulation length [s]")
     ap.add_argument("--speed", type=float, default=1.0, help="playback speed (1 = real time)")
     ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--att", type=float, nargs=3, default=(1, 0, 0), metavar=("PITCH", "ROLL", "YAW"),
+                    help="attitude target in degrees, e.g. --att 0 10 0")
     ap.add_argument("--legacy", action="store_true", help="original (unstable) Simulink gains/limits")
     ap.add_argument("--save", type=str, default=None, help="output .gif instead of a window")
     a = ap.parse_args()
 
-    rr.CTRL = QuadController(z_ref=a.zref, tuned=not a.legacy)
+    rr.CTRL = QuadController(z_ref=a.zref, tuned=not a.legacy, att_ref_deg=a.att)
     sol = rr.run(t_end=a.tend, dt_out=0.01)
     t, x = sol.t, sol.y.T
     pos, th = x[:, 0:3], x[:, 6:9]
