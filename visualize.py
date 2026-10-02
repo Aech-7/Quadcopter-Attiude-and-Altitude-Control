@@ -16,7 +16,7 @@ so the quad is always visible regardless of how far it drifts.
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
 
 try:
     import run as rr
@@ -53,7 +53,7 @@ def main():
                     help="attitude target [deg]. When --xy is also given, only yaw is used "
                          "(XY controller commands pitch/roll). Default: (0,0,0).")
     ap.add_argument("--legacy", action="store_true", help="original (unstable) Simulink gains")
-    ap.add_argument("--save",  type=str, default=None, help="output .gif instead of a window")
+    ap.add_argument("--save",  type=str, default=None, help="output .mp4 or .gif instead of a window")
     a = ap.parse_args()
 
     # When --xy is active: XY PID drives pitch/roll, att_ref only contributes yaw.
@@ -72,52 +72,75 @@ def main():
     step = max(1, int(round(a.speed / a.fps / 0.01)))
     idx = np.arange(0, len(t), step)
 
-    # --- Follow-cam window ---
-    # Fixed-size view centred on the quad's current position each frame.
-    # Span is set just large enough to comfortably show the quad and target.
-    if a.xy is not None:
-        dist = np.hypot(a.xy[0], a.xy[1])          # distance to XY target
-        span = max(dist * 1.4, a.zref * 1.5, 6.0)  # wide enough to include target
-    else:
-        span = max(a.zref * 1.5, 6.0)              # altitude-relative window
+    goal = np.array([*(a.xy if a.xy is not None else (0.0, 0.0)), a.zref])
+    initial_span = max(np.max(np.abs(pos[0] - goal)) * 1.45, 5.0)
+    route_points = np.vstack((pos, goal))
+    route_center = (route_points.min(axis=0) + route_points.max(axis=0)) / 2
+    route_span = max(np.ptp(route_points, axis=0).max() * 1.25, 5.0)
+    zoom_frames = max(1, round(a.fps * 1.25))
+    overview_frames = max(1, round(a.fps * 1.0))
+    closing_frames = zoom_frames + overview_frames
 
-    L = span * 0.07          # drawn arm length (scales with view)
+    L = initial_span * 0.07
     motors_body = L / np.sqrt(2) * np.array([[-1,-1,0],[-1,1,0],[1,1,0],[1,-1,0]])
-    colors = ["tab:red", "tab:blue", "tab:green", "tab:orange"]
 
-    fig = plt.figure(figsize=(8, 7))
-    ax  = fig.add_subplot(111, projection="3d")
+    bg = "#252a2d"
+    pane = "#343a3e"
+    fig = plt.figure(figsize=(6.75, 12), dpi=160, facecolor=bg)
+    ax  = fig.add_subplot(111, projection="3d", facecolor=bg)
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.98)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.pane.set_facecolor(pane)
+        axis.pane.set_edgecolor("#697278")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_zlabel("z [m]")
-    ax.set_box_aspect((1, 1, 1))
+    ax.tick_params(colors="#d1d6d9", labelsize=9)
+    ax.xaxis.label.set_color("#d1d6d9")
+    ax.yaxis.label.set_color("#d1d6d9")
+    ax.zaxis.label.set_color("#d1d6d9")
+    ax.set_box_aspect((1, 1, 1.35))
+    ax.view_init(elev=28, azim=-55)
 
-    # Setpoint marker
-    if a.xy is not None:
-        ax.plot([a.xy[0]], [a.xy[1]], [a.zref], "k+", ms=14, zorder=5,
-                label=f"target ({a.xy[0]:g}, {a.xy[1]:g}, {a.zref:g}) m")
-        ax.plot([a.xy[0], a.xy[0]], [a.xy[1], a.xy[1]], [0, a.zref],
-                "--", c="gray", lw=1, alpha=0.5)
-    else:
-        ax.plot([0], [0], [a.zref], "k+", ms=12, label=f"z_ref = {a.zref:g} m")
+    ax.plot([goal[0], goal[0]], [goal[1], goal[1]], [0, goal[2]],
+            "--", c="#f4bd58", lw=1.8, alpha=0.8)
+    ax.scatter(*goal, marker="*", s=220, c="#ffd166", edgecolors="white",
+               linewidths=0.9, depthshade=False)
+    ax.text(goal[0], goal[1], goal[2] + 0.35, "TARGET", color="#ffd166",
+            fontsize=10, fontweight="bold", ha="center")
 
-    trail,  = ax.plot([], [], [], "-",  c="gray",     lw=1)
-    shadow, = ax.plot([], [], [], "o",  c="lightgray", ms=6)
-    arm1,   = ax.plot([], [], [], "-",  c="k",         lw=2)
-    arm2,   = ax.plot([], [], [], "-",  c="k",         lw=2)
-    dots = [ax.plot([], [], [], "o", c=col, ms=8)[0] for col in colors]
-    nose,   = ax.plot([], [], [], "-",  c="m",         lw=3)
-    txt = ax.text2D(0.02, 0.95, "", transform=ax.transAxes, family="monospace")
-    ax.legend(loc="upper right")
+    ax.plot(pos[:, 0], pos[:, 1], pos[:, 2], "--", c="#778187", lw=1.5, alpha=0.7)
+    trail,  = ax.plot([], [], [], "-", c="#55dbc6", lw=3.2)
+    shadow, = ax.plot([], [], [], "o", c="#aeb7bc", ms=6)
+    arm1,   = ax.plot([], [], [], "-", c="#d9dfe2", lw=2.6)
+    arm2,   = ax.plot([], [], [], "-", c="#d9dfe2", lw=2.6)
+    motor_colors = ["tab:red", "tab:blue", "tab:green", "tab:orange"]
+    dots = [ax.plot([], [], [], "o", c=color, ms=8)[0] for color in motor_colors]
+    nose,   = ax.plot([], [], [], "-", c="#55dbc6", lw=3.2)
+    txt = ax.text2D(0.04, 0.96, "", transform=ax.transAxes, family="monospace",
+                    color="#f1f3f4", fontsize=11, va="top",
+                    bbox={"facecolor": pane, "edgecolor": "#697278", "alpha": 0.9,
+                          "boxstyle": "round,pad=0.5"})
 
     def update(k):
-        i   = idx[k]
+        closing = k >= len(idx)
+        if closing:
+            i = idx[-1]
+            close_k = k - len(idx)
+        else:
+            i = idx[k]
         R, p = rot(th[i]), pos[i]
         w   = (R @ motors_body.T).T + p          # world positions of the 4 motors
 
-        # --- Follow-cam: re-centre axes on current quad position every frame ---
-        cx, cy, cz = p[0], p[1], max(p[2], span / 2)
-        ax.set_xlim(cx - span / 2, cx + span / 2)
-        ax.set_ylim(cy - span / 2, cy + span / 2)
-        ax.set_zlim(max(0, cz - span / 2), max(0, cz - span / 2) + span)
+        # Keep the quad prominent while framing the goal; the view tightens on approach.
+        focus = 0.55 * p + 0.45 * goal
+        span = max(np.max(np.abs(p - goal)) * 1.45, 5.0)
+        if closing:
+            progress = min(close_k / zoom_frames, 1.0)
+            eased = progress * progress * (3 - 2 * progress)
+            focus = focus * (1 - eased) + route_center * eased
+            span = span * (1 - eased) + route_span * eased
+        ax.set_xlim(focus[0] - span / 2, focus[0] + span / 2)
+        ax.set_ylim(focus[1] - span / 2, focus[1] + span / 2)
+        ax.set_zlim(max(0, focus[2] - span / 2), max(0, focus[2] - span / 2) + span)
 
         # Draw quad body
         arm1.set_data_3d(*zip(w[0], w[2]))
@@ -136,9 +159,17 @@ def main():
                      f"pitch/roll/yaw = {d3[0]:.1f}/{d3[1]:.1f}/{d3[2]:.1f} deg")
         return []
 
-    anim = FuncAnimation(fig, update, frames=len(idx), interval=1000 / a.fps, blit=False)
+    anim = FuncAnimation(fig, update, frames=len(idx) + closing_frames,
+                         interval=1000 / a.fps, blit=False)
     if a.save:
-        anim.save(a.save, writer=PillowWriter(fps=a.fps))
+        if a.save.lower().endswith(".mp4"):
+            writer = FFMpegWriter(fps=a.fps, codec="libx264", bitrate=5000,
+                                  extra_args=["-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+        elif a.save.lower().endswith(".gif"):
+            writer = PillowWriter(fps=a.fps)
+        else:
+            ap.error("--save output must end in .mp4 or .gif")
+        anim.save(a.save, writer=writer)
         print("saved", a.save)
     else:
         plt.show()
